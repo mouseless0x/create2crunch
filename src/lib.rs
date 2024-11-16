@@ -295,7 +295,7 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
                     }))
                     .send();
 
-                println!("Found salt ${:x} for address {}", salt, address);
+                println!("Found salt {} for address {}", score, address);
 
                 if let Err(e) = result {
                     eprintln!("Failed to send result to endpoint: {}", e);
