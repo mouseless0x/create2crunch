@@ -206,20 +206,20 @@ static inline int score_address(uchar const *d) {
     score += leading_zeros * 10;
 
     // Find first '4' and check if it's followed by three more 4s
-    bool found_four_fours = false;
-    for (int i = 0; i < 37; i++) {
-        if (nibbles[i] == 4) {
-            if (nibbles[i+1] == 4 &&
-                nibbles[i+2] == 4 &&
-                nibbles[i+3] == 4) {
-                score += 40;  // Found four 4s
-                if (i+4 < 40 && nibbles[i+4] != 4) {
-                    score += 20;  // Next nibble is not 4
-                }
-                found_four_fours = true;
-                break;
-            }
+    int start_idx = leading_zeros;
+    if (nibbles[start_idx] === 4 &&
+        nibbles[start_idx + 1] == 4 &&
+        nibbles[start_idx + 2] == 4 &&
+        nibbles[start_idx + 3] == 4) {
+        score += 40;
+
+        // First nibble after row of 4 is not a 4
+        if (start_idx + 4 < 40 && nibbles[i+4] != 4) {
+            score += 20;
         }
+
+        found_four_fours = true;
+        break;
     }
 
     // Check if last 4 nibbles are all 4s
