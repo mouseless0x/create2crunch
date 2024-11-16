@@ -2,9 +2,9 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 
 use alloy_primitives::{hex, Address, FixedBytes};
-use reqwest::blocking::Client;
 use ocl::{Buffer, Context, Device, MemFlags, Platform, ProQue, Program, Queue};
 use rand::{thread_rng, Rng};
+use reqwest::blocking::Client;
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tiny_keccak::{Hasher, Keccak};
@@ -155,6 +155,9 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
     // the last work duration in milliseconds
     let mut work_duration_millis: u64 = 0;
 
+    // Initialize the highest score found so far
+    let mut highest_score = 0;
+
     // begin searching for addresses
     loop {
         // construct the 4-byte message to hash, leaving last 8 of salt empty
@@ -276,26 +279,29 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             // score the address
             let score = score_address::score_address(address.as_slice());
 
-            // Send result to configured endpoint
-            let result = client
-                .post(&config.endpoint_url)
-                .json(&serde_json::json!({
-                    "salt": format!("0x{}{}{}",
-                        hex::encode(config.calling_address),
-                        hex::encode(salt),
-                        hex::encode(solution)),
-                    "address": address.to_string(),
-                    "score": score
-                }))
-                .send();
+            if score > highest_score {
+                highest_score = score;
 
-            if let Err(e) = result {
-                eprintln!("Failed to send result to endpoint: {}", e);
+                // Send result to configured endpoint
+                let result = client
+                    .post(&config.endpoint_url)
+                    .json(&serde_json::json!({
+                        "salt": format!("0x{}{}{}",
+                            hex::encode(config.calling_address),
+                            hex::encode(salt),
+                            hex::encode(solution)),
+                        "address": address.to_string(),
+                        "score": score
+                    }))
+                    .send();
+
+                if let Err(e) = result {
+                    eprintln!("Failed to send result to endpoint: {}", e);
+                }
             }
         }
     }
 }
-
 
 /// Creates the OpenCL kernel source code by populating the template with the
 /// values from the Config object.
