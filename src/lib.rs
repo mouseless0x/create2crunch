@@ -1,32 +1,19 @@
-#![warn(unused_crate_dependencies, unreachable_pub)]
+#![warn(unreachable_pub)]
 #![deny(unused_must_use, rust_2018_idioms)]
 
 use alloy_primitives::{hex, Address, FixedBytes};
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
-use console::Term;
-use fs4::FileExt;
+use reqwest::blocking::Client;
 use ocl::{Buffer, Context, Device, MemFlags, Platform, ProQue, Program, Queue};
 use rand::{thread_rng, Rng};
-use rayon::prelude::*;
-use separator::Separatable;
-use std::error::Error;
 use std::fmt::Write as _;
-use std::fs::{File, OpenOptions};
-use std::io::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
-use terminal_size::{terminal_size, Height};
 use tiny_keccak::{Hasher, Keccak};
 
-mod reward;
-pub use reward::Reward;
+pub mod score_address;
 
 // workset size (tweak this!)
 const WORK_SIZE: u32 = 0x4000000; // max. 0x15400000 to abs. max 0xffffffff
-
-const WORK_FACTOR: u128 = (WORK_SIZE as u128) / 1_000_000;
 const CONTROL_CHARACTER: u8 = 0xff;
-const MAX_INCREMENTER: u64 = 0xffffffffffff;
-
 static KERNEL_SRC: &str = include_str!("./kernels/keccak256.cl");
 
 /// Requires three hex-encoded arguments: the address of the contract that will
@@ -43,8 +30,7 @@ pub struct Config {
     pub calling_address: [u8; 20],
     pub init_code_hash: [u8; 32],
     pub gpu_device: u8,
-    pub leading_zeroes_threshold: u8,
-    pub total_zeroes_threshold: u8,
+    pub endpoint_url: String,
 }
 
 /// Validate the provided arguments and construct the Config struct.
@@ -67,13 +53,9 @@ impl Config {
             Some(arg) => arg,
             None => String::from("255"), // indicates that CPU will be used.
         };
-        let leading_zeroes_threshold_string = match args.next() {
+        let endpoint_url = match args.next() {
             Some(arg) => arg,
-            None => String::from("3"),
-        };
-        let total_zeroes_threshold_string = match args.next() {
-            Some(arg) => arg,
-            None => String::from("5"),
+            None => panic!("need endpoint_url"),
         };
 
         // convert main arguments from hex string to vector of bytes
@@ -102,136 +84,14 @@ impl Config {
         let Ok(gpu_device) = gpu_device_string.parse::<u8>() else {
             return Err("invalid gpu device value");
         };
-        let Ok(leading_zeroes_threshold) = leading_zeroes_threshold_string.parse::<u8>() else {
-            return Err("invalid leading zeroes threshold value supplied");
-        };
-        let Ok(total_zeroes_threshold) = total_zeroes_threshold_string.parse::<u8>() else {
-            return Err("invalid total zeroes threshold value supplied");
-        };
-
-        if leading_zeroes_threshold > 20 {
-            return Err("invalid value for leading zeroes threshold argument. (valid: 0..=20)");
-        }
-        if total_zeroes_threshold > 20 && total_zeroes_threshold != 255 {
-            return Err("invalid value for total zeroes threshold argument. (valid: 0..=20 | 255)");
-        }
 
         Ok(Self {
             factory_address,
             calling_address,
             init_code_hash,
             gpu_device,
-            leading_zeroes_threshold,
-            total_zeroes_threshold,
+            endpoint_url,
         })
-    }
-}
-
-/// Given a Config object with a factory address, a caller address, and a
-/// keccak-256 hash of the contract initialization code, search for salts that
-/// will enable the factory contract to deploy a contract to a gas-efficient
-/// address via CREATE2.
-///
-/// The 32-byte salt is constructed as follows:
-///   - the 20-byte calling address (to prevent frontrunning)
-///   - a random 6-byte segment (to prevent collisions with other runs)
-///   - a 6-byte nonce segment (incrementally stepped through during the run)
-///
-/// When a salt that will result in the creation of a gas-efficient contract
-/// address is found, it will be appended to `efficient_addresses.txt` along
-/// with the resultant address and the "value" (i.e. approximate rarity) of the
-/// resultant address.
-pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
-    // (create if necessary) and open a file where found salts will be written
-    let file = output_file();
-
-    // create object for computing rewards (relative rarity) for a given address
-    let rewards = Reward::new();
-
-    // begin searching for addresses
-    loop {
-        // header: 0xff ++ factory ++ caller ++ salt_random_segment (47 bytes)
-        let mut header = [0; 47];
-        header[0] = CONTROL_CHARACTER;
-        header[1..21].copy_from_slice(&config.factory_address);
-        header[21..41].copy_from_slice(&config.calling_address);
-        header[41..].copy_from_slice(&FixedBytes::<6>::random()[..]);
-
-        // create new hash object
-        let mut hash_header = Keccak::v256();
-
-        // update hash with header
-        hash_header.update(&header);
-
-        // iterate over a 6-byte nonce and compute each address
-        (0..MAX_INCREMENTER)
-            .into_par_iter() // parallelization
-            .for_each(|salt| {
-                let salt = salt.to_le_bytes();
-                let salt_incremented_segment = &salt[..6];
-
-                // clone the partially-hashed object
-                let mut hash = hash_header.clone();
-
-                // update with body and footer (total: 38 bytes)
-                hash.update(salt_incremented_segment);
-                hash.update(&config.init_code_hash);
-
-                // hash the payload and get the result
-                let mut res: [u8; 32] = [0; 32];
-                hash.finalize(&mut res);
-
-                // get the address that results from the hash
-                let address = <&Address>::try_from(&res[12..]).unwrap();
-
-                // count total and leading zero bytes
-                let mut total = 0;
-                let mut leading = 21;
-                for (i, &b) in address.iter().enumerate() {
-                    if b == 0 {
-                        total += 1;
-                    } else if leading == 21 {
-                        // set leading on finding non-zero byte
-                        leading = i;
-                    }
-                }
-
-                // only proceed if there are at least three zero bytes
-                if total < 3 {
-                    return;
-                }
-
-                // look up the reward amount
-                let key = leading * 20 + total;
-                let reward_amount = rewards.get(&key);
-
-                // only proceed if an efficient address has been found
-                if reward_amount.is_none() {
-                    return;
-                }
-
-                // get the full salt used to create the address
-                let header_hex_string = hex::encode(header);
-                let body_hex_string = hex::encode(salt_incremented_segment);
-                let full_salt = format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
-
-                // display the salt and the address.
-                let output = format!(
-                    "{full_salt} => {address} => {}",
-                    reward_amount.unwrap_or("0")
-                );
-                println!("{output}");
-
-                // create a lock on the file before writing
-                file.lock_exclusive().expect("Couldn't lock file.");
-
-                // write the result to file
-                writeln!(&file, "{output}")
-                    .expect("Couldn't write to `efficient_addresses.txt` file.");
-
-                // release the file lock
-                file.unlock().expect("Couldn't unlock file.")
-            });
     }
 }
 
@@ -262,18 +122,8 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
         config.gpu_device
     );
 
-    // (create if necessary) and open a file where found salts will be written
-    let file = output_file();
-
-    // create object for computing rewards (relative rarity) for a given address
-    let rewards = Reward::new();
-
-    // track how many addresses have been found and information about them
-    let mut found: u64 = 0;
-    let mut found_list: Vec<String> = vec![];
-
-    // set up a controller for terminal output
-    let term = Term::stdout();
+    // Create HTTP client for sending results
+    let client = Client::new();
 
     // set up a platform to use
     let platform = Platform::new(ocl::core::default_platform()?);
@@ -302,19 +152,6 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
     // create a random number generator
     let mut rng = thread_rng();
 
-    // determine the start time
-    let start_time: f64 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64();
-
-    // set up variables for tracking performance
-    let mut rate: f64 = 0.0;
-    let mut cumulative_nonce: u64 = 0;
-
-    // the previous timestamp of printing to the terminal
-    let mut previous_time: f64 = 0.0;
-
     // the last work duration in milliseconds
     let mut work_duration_millis: u64 = 0;
 
@@ -334,7 +171,6 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
         // reset nonce & create a buffer to view it in little-endian
         // for more uniformly distributed nonces, we shall initialize it to a random value
         let mut nonce: [u32; 1] = rng.gen();
-        let mut view_buf = [0; 8];
 
         // build a corresponding buffer for passing the nonce to the kernel
         let mut nonce_buffer = Buffer::builder()
@@ -371,77 +207,7 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             // enqueue the kernel
             unsafe { kern.enq()? };
 
-            // calculate the current time
             let mut now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-            let current_time = now.as_secs() as f64;
-
-            // we don't want to print too fast
-            let print_output = current_time - previous_time > 0.99;
-            previous_time = current_time;
-
-            // clear the terminal screen
-            if print_output {
-                term.clear_screen()?;
-
-                // get the total runtime and parse into hours : minutes : seconds
-                let total_runtime = current_time - start_time;
-                let total_runtime_hrs = total_runtime as u64 / 3600;
-                let total_runtime_mins = (total_runtime as u64 - total_runtime_hrs * 3600) / 60;
-                let total_runtime_secs = total_runtime
-                    - (total_runtime_hrs * 3600) as f64
-                    - (total_runtime_mins * 60) as f64;
-
-                // determine the number of attempts being made per second
-                let work_rate: u128 = WORK_FACTOR * cumulative_nonce as u128;
-                if total_runtime > 0.0 {
-                    rate = 1.0 / total_runtime;
-                }
-
-                // fill the buffer for viewing the properly-formatted nonce
-                LittleEndian::write_u64(&mut view_buf, (nonce[0] as u64) << 32);
-
-                // calculate the terminal height, defaulting to a height of ten rows
-                let height = terminal_size().map(|(_w, Height(h))| h).unwrap_or(10);
-
-                // display information about the total runtime and work size
-                term.write_line(&format!(
-                    "total runtime: {}:{:02}:{:02} ({} cycles)\t\t\t\
-                     work size per cycle: {}",
-                    total_runtime_hrs,
-                    total_runtime_mins,
-                    total_runtime_secs,
-                    cumulative_nonce,
-                    WORK_SIZE.separated_string(),
-                ))?;
-
-                // display information about the attempt rate and found solutions
-                term.write_line(&format!(
-                    "rate: {:.2} million attempts per second\t\t\t\
-                     total found this run: {}",
-                    work_rate as f64 * rate,
-                    found
-                ))?;
-
-                // display information about the current search criteria
-                term.write_line(&format!(
-                    "current search space: {}xxxxxxxx{:08x}\t\t\
-                     threshold: {} leading or {} total zeroes",
-                    hex::encode(salt),
-                    BigEndian::read_u64(&view_buf),
-                    config.leading_zeroes_threshold,
-                    config.total_zeroes_threshold
-                ))?;
-
-                // display recently found solutions based on terminal height
-                let rows = if height < 5 { 1 } else { height as usize - 4 };
-                let last_rows: Vec<String> = found_list.iter().cloned().rev().take(rows).collect();
-                let ordered: Vec<String> = last_rows.iter().cloned().rev().collect();
-                let recently_found = &ordered.join("\n");
-                term.write_line(recently_found)?;
-            }
-
-            // increment the cumulative nonce (does not reset after a match)
-            cumulative_nonce += 1;
 
             // record the start time of the work
             let work_start_time_millis = now.as_secs() * 1000 + now.subsec_nanos() as u64 / 1000000;
@@ -507,51 +273,29 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             // get the address that results from the hash
             let address = <&Address>::try_from(&res[12..]).unwrap();
 
-            // count total and leading zero bytes
-            let mut total = 0;
-            let mut leading = 0;
-            for (i, &b) in address.iter().enumerate() {
-                if b == 0 {
-                    total += 1;
-                } else if leading == 0 {
-                    // set leading on finding non-zero byte
-                    leading = i;
-                }
+            // score the address
+            let score = score_address::score_address(address.as_slice());
+
+            // Send result to configured endpoint
+            let result = client
+                .post(&config.endpoint_url)
+                .json(&serde_json::json!({
+                    "salt": format!("0x{}{}{}",
+                        hex::encode(config.calling_address),
+                        hex::encode(salt),
+                        hex::encode(solution)),
+                    "address": address.to_string(),
+                    "score": score
+                }))
+                .send();
+
+            if let Err(e) = result {
+                eprintln!("Failed to send result to endpoint: {}", e);
             }
-
-            let key = leading * 20 + total;
-            let reward = rewards.get(&key).unwrap_or("0");
-            let output = format!(
-                "0x{}{}{} => {} => {}",
-                hex::encode(config.calling_address),
-                hex::encode(salt),
-                hex::encode(solution),
-                address,
-                reward,
-            );
-
-            let show = format!("{output} ({leading} / {total})");
-            found_list.push(show.to_string());
-
-            file.lock_exclusive().expect("Couldn't lock file.");
-
-            writeln!(&file, "{output}").expect("Couldn't write to `efficient_addresses.txt` file.");
-
-            file.unlock().expect("Couldn't unlock file.");
-            found += 1;
         }
     }
 }
 
-#[track_caller]
-fn output_file() -> File {
-    OpenOptions::new()
-        .append(true)
-        .create(true)
-        .read(true)
-        .open("efficient_addresses.txt")
-        .expect("Could not create or open `efficient_addresses.txt` file.")
-}
 
 /// Creates the OpenCL kernel source code by populating the template with the
 /// values from the Config object.
@@ -565,12 +309,7 @@ fn mk_kernel_src(config: &Config) -> String {
     for (i, x) in factory.chain(caller).enumerate().chain(hash) {
         writeln!(src, "#define S_{} {}u", i + 1, x).unwrap();
     }
-    let lz = config.leading_zeroes_threshold;
-    writeln!(src, "#define LEADING_ZEROES {lz}").unwrap();
-    let tz = config.total_zeroes_threshold;
-    writeln!(src, "#define TOTAL_ZEROES {tz}").unwrap();
 
     src.push_str(KERNEL_SRC);
-
     src
 }

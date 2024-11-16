@@ -1,4 +1,4 @@
-use create2crunch::Config;
+use fourfourfourfour::Config;
 use std::env;
 use std::process;
 
@@ -8,12 +8,7 @@ fn main() {
         process::exit(1);
     });
 
-    if config.gpu_device == 255 {
-        if let Err(e) = create2crunch::cpu(config) {
-            eprintln!("CPU application error: {e}");
-            process::exit(1);
-        }
-    } else if let Err(e) = create2crunch::gpu(config) {
+    if let Err(e) = fourfourfourfour::gpu(config) {
         eprintln!("GPU application error: {e}");
         process::exit(1);
     }
