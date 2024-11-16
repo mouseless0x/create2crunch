@@ -1,0 +1,3 @@
+[submodule "UniswapV4DeployerCompetition/lib/forge-std"]
+	path = UniswapV4DeployerCompetition/lib/forge-std
+	url = https://github.com/foundry-rs/forge-std
