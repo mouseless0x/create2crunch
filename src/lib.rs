@@ -8,7 +8,9 @@ use fs4::FileExt;
 use ocl::{Buffer, Context, Device, MemFlags, Platform, ProQue, Program, Queue};
 use rand::{thread_rng, Rng};
 use rayon::prelude::*;
+use reqwest::blocking::Client;
 use separator::Separatable;
+use serde_json::json;
 use std::error::Error;
 use std::fmt::Write as _;
 use std::fs::{File, OpenOptions};
@@ -45,6 +47,7 @@ pub struct Config {
     pub gpu_device: u8,
     pub leading_zeroes_threshold: u8,
     pub total_zeroes_threshold: u8,
+    pub endpoint_url: Option<String>,
 }
 
 /// Validate the provided arguments and construct the Config struct.
@@ -52,6 +55,12 @@ impl Config {
     pub fn new(mut args: std::env::Args) -> Result<Self, &'static str> {
         // get args, skipping first arg (program name)
         args.next();
+
+        // Get the required endpoint URL
+        let Some(endpoint_url_string) = args.next() else {
+            return Err("didn't get an endpoint_url argument");
+        };
+        let endpoint_url = Some(endpoint_url_string);
 
         let Some(factory_address_string) = args.next() else {
             return Err("didn't get a factory_address argument");
@@ -123,6 +132,7 @@ impl Config {
             gpu_device,
             leading_zeroes_threshold,
             total_zeroes_threshold,
+            endpoint_url,
         })
     }
 }
@@ -147,6 +157,9 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
 
     // create object for computing rewards (relative rarity) for a given address
     let rewards = Reward::new();
+
+    // Create reqwest client if endpoint is provided
+    let client = config.endpoint_url.as_ref().map(|_| Client::new());
 
     // begin searching for addresses
     loop {
@@ -230,7 +243,25 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
                     .expect("Couldn't write to `efficient_addresses.txt` file.");
 
                 // release the file lock
-                file.unlock().expect("Couldn't unlock file.")
+                file.unlock().expect("Couldn't unlock file.");
+
+                // Send result to configured endpoint if available
+                if let (Some(client), Some(endpoint_url)) = (&client, &config.endpoint_url) {
+                    let score = reward_amount.unwrap_or("0").to_string();
+
+                    // Try to send the result to the endpoint
+                    let _ = client
+                        .post(endpoint_url)
+                        .json(&json!({
+                            "salt": format!("0x{}{}{}",
+                                hex::encode(config.calling_address),
+                                hex::encode(&header[41..]),
+                                hex::encode(salt_incremented_segment)),
+                            "address": address.to_string(),
+                            "score": score
+                        }))
+                        .send();
+                }
             });
     }
 }
@@ -267,6 +298,9 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
 
     // create object for computing rewards (relative rarity) for a given address
     let rewards = Reward::new();
+
+    // Create reqwest client if endpoint is provided
+    let client = config.endpoint_url.as_ref().map(|_| Client::new());
 
     // track how many addresses have been found and information about them
     let mut found: u64 = 0;
@@ -538,6 +572,25 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             writeln!(&file, "{output}").expect("Couldn't write to `efficient_addresses.txt` file.");
 
             file.unlock().expect("Couldn't unlock file.");
+
+            // Send result to configured endpoint if available
+            if let (Some(client), Some(endpoint_url)) = (&client, &config.endpoint_url) {
+                let score = reward.to_string();
+
+                // Try to send the result to the endpoint
+                let _ = client
+                    .post(endpoint_url)
+                    .json(&json!({
+                        "salt": format!("0x{}{}{}",
+                            hex::encode(config.calling_address),
+                            hex::encode(salt),
+                            hex::encode(solution)),
+                        "address": address.to_string(),
+                        "score": score
+                    }))
+                    .send();
+            }
+
             found += 1;
         }
     }
